@@ -3,7 +3,7 @@ import { getIceServers } from '../services/webrtc';
 
 const CALL_TIMEOUT_MS = 30000;
 
-// callState: 'idle' | 'outgoing' | 'incoming' | 'connected'
+// callState: 'idle' | 'outgoing' | 'incoming' | 'connecting' | 'connected'
 export const useCall = (socket) => {
   const [callState, setCallState] = useState('idle');
   const [callType, setCallType] = useState('video'); // 'audio' | 'video'
@@ -20,6 +20,13 @@ export const useCall = (socket) => {
   const timeoutRef = useRef(null);
   const callStateRef = useRef('idle');
 
+  // ICE candidates from the other side can arrive before our own
+  // RTCPeerConnection exists (e.g. the caller's candidates start flowing
+  // the moment they click call, long before the callee has clicked Accept).
+  // Any candidate that arrives too early gets queued here and is flushed
+  // once the peer connection is actually created, instead of being dropped.
+  const pendingCandidatesRef = useRef([]);
+
   useEffect(() => {
     callStateRef.current = callState;
   }, [callState]);
@@ -34,6 +41,7 @@ export const useCall = (socket) => {
   const cleanup = useCallback(() => {
     clearCallTimeout();
     if (pcRef.current) {
+      pcRef.current.onconnectionstatechange = null;
       pcRef.current.close();
       pcRef.current = null;
     }
@@ -42,12 +50,25 @@ export const useCall = (socket) => {
       localStreamRef.current = null;
     }
     pendingOfferRef.current = null;
+    pendingCandidatesRef.current = [];
     setLocalStream(null);
     setRemoteStream(null);
     setPeerInfo(null);
     setIsMuted(false);
     setIsCameraOff(false);
     setCallState('idle');
+  }, []);
+
+  const flushPendingCandidates = useCallback(async (pc) => {
+    const queued = pendingCandidatesRef.current;
+    pendingCandidatesRef.current = [];
+    for (const candidate of queued) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // Invalid/stale candidate — safe to skip.
+      }
+    }
   }, []);
 
   const createPeerConnection = useCallback(
@@ -64,10 +85,26 @@ export const useCall = (socket) => {
         setRemoteStream(event.streams[0]);
       };
 
+      // The offer/answer handshake completing doesn't mean media is
+      // actually flowing yet — track the real transport state so the UI
+      // isn't lying about "connected" while negotiation is still underway
+      // or has failed outright.
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') {
+          clearCallTimeout();
+          setCallState('connected');
+        } else if (pc.connectionState === 'failed') {
+          setCallError('Call connection failed — check your network and try again');
+          cleanup();
+        }
+      };
+
       pcRef.current = pc;
+      // Apply any ICE candidates that arrived before this connection existed.
+      flushPendingCandidates(pc);
       return pc;
     },
-    [socket]
+    [socket, cleanup, flushPendingCandidates]
   );
 
   const startCall = useCallback(
@@ -125,6 +162,8 @@ export const useCall = (socket) => {
       localStreamRef.current = stream;
       setLocalStream(stream);
 
+      // Creating the peer connection here also flushes any ICE candidates
+      // from the caller that arrived while we were still ringing.
       const pc = createPeerConnection(fromUserId);
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
@@ -134,7 +173,9 @@ export const useCall = (socket) => {
 
       socket.emit('answer_call', { toUserId: fromUserId, answer });
       pendingOfferRef.current = null;
-      setCallState('connected');
+      // Signaling is done; actual "connected" now waits on
+      // onconnectionstatechange so the UI reflects real media state.
+      setCallState('connecting');
     } catch (err) {
       setCallError('Camera/microphone access denied or unavailable');
       socket.emit('call_declined', { toUserId: fromUserId });
@@ -191,7 +232,9 @@ export const useCall = (socket) => {
       if (!pcRef.current) return;
       try {
         await pcRef.current.setRemoteDescription(new RTCSessionDescription(answer));
-        setCallState('connected');
+        // Signaling is done; actual "connected" now waits on
+        // onconnectionstatechange so the UI reflects real media state.
+        setCallState('connecting');
       } catch {
         setCallError('Failed to connect the call');
         cleanup();
@@ -199,7 +242,15 @@ export const useCall = (socket) => {
     };
 
     const handleIceCandidate = async ({ candidate }) => {
-      if (!pcRef.current || !candidate) return;
+      if (!candidate) return;
+
+      // No peer connection yet (e.g. we haven't accepted the call yet) —
+      // queue it instead of dropping it.
+      if (!pcRef.current) {
+        pendingCandidatesRef.current.push(candidate);
+        return;
+      }
+
       try {
         await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
       } catch {

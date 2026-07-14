@@ -31,8 +31,21 @@ const CallModal = ({
   }, [localStream]);
 
   useEffect(() => {
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream || null;
-    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = remoteStream || null;
+    // Assigning srcObject doesn't guarantee playback starts — some browsers
+    // (especially mobile) require an explicit play() call, and the promise
+    // can reject silently under autoplay restrictions if not awaited/caught.
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = remoteStream || null;
+      if (remoteStream) {
+        remoteVideoRef.current.play().catch(() => {});
+      }
+    }
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject = remoteStream || null;
+      if (remoteStream) {
+        remoteAudioRef.current.play().catch(() => {});
+      }
+    }
   }, [remoteStream]);
 
   useEffect(() => {
@@ -66,6 +79,7 @@ const CallModal = ({
             <p className="mt-1 text-sm text-slate-300">
               {callState === 'outgoing' && `Calling… (${callType})`}
               {callState === 'incoming' && `Incoming ${callType} call`}
+              {callState === 'connecting' && 'Connecting…'}
               {callState === 'connected' && formatDuration(duration)}
             </p>
             {callError && <p className="mt-2 text-sm text-red-400">{callError}</p>}
@@ -79,7 +93,7 @@ const CallModal = ({
         </p>
       )}
 
-      {callType === 'video' && callState === 'connected' && (
+      {callType === 'video' && localStream && (
         <div className="absolute right-4 top-4 h-32 w-24 overflow-hidden rounded-xl bg-slate-800 shadow-lg ring-1 ring-white/10 sm:h-40 sm:w-28">
           <video
             ref={localVideoRef}
