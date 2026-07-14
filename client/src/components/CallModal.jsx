@@ -63,15 +63,18 @@ const CallModal = ({
   }, [localStream]);
 
   useEffect(() => {
-    if (remoteVideoRef.current) {
+    // Keep the remote media element mounted throughout negotiation. The
+    // remote stream may arrive before callState becomes "connected".
+    if (callType === 'video' && remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = remoteStream || null;
       if (remoteStream) remoteVideoRef.current.play().catch(() => {});
     }
-    if (remoteAudioRef.current) {
+
+    if (callType === 'audio' && remoteAudioRef.current) {
       remoteAudioRef.current.srcObject = remoteStream || null;
       if (remoteStream) remoteAudioRef.current.play().catch(() => {});
     }
-  }, [remoteStream]);
+  }, [remoteStream, callType, callState]);
 
   useEffect(() => {
     if (callState !== 'connected') {
@@ -91,14 +94,18 @@ const CallModal = ({
     <div className="fixed inset-0 z-[60] overflow-hidden bg-[#111b21] text-white">
       <audio ref={remoteAudioRef} autoPlay className="hidden" />
 
-      {showRemoteVideo ? (
+      {callType === 'video' && (
         <video
           ref={remoteVideoRef}
           autoPlay
           playsInline
-          className="absolute inset-0 h-full w-full object-cover"
+          className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-300 ${
+            showRemoteVideo ? 'opacity-100' : 'opacity-0'
+          }`}
         />
-      ) : (
+      )}
+
+      {!showRemoteVideo && (
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_#214740_0%,_#152d2a_35%,_#111b21_72%)]" />
       )}
 

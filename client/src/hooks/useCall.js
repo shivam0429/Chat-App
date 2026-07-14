@@ -16,90 +16,108 @@ export const useCall = (socket) => {
 
   const pcRef = useRef(null);
   const localStreamRef = useRef(null);
+  const remoteStreamRef = useRef(null);
   const pendingOfferRef = useRef(null);
+  const pendingCandidatesRef = useRef([]);
   const timeoutRef = useRef(null);
   const callStateRef = useRef('idle');
-
-  // ICE candidates from the other side can arrive before our own
-  // RTCPeerConnection exists (e.g. the caller's candidates start flowing
-  // the moment they click call, long before the callee has clicked Accept).
-  // Any candidate that arrives too early gets queued here and is flushed
-  // once the peer connection is actually created, instead of being dropped.
-  const pendingCandidatesRef = useRef([]);
 
   useEffect(() => {
     callStateRef.current = callState;
   }, [callState]);
 
-  const clearCallTimeout = () => {
+  const clearCallTimeout = useCallback(() => {
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
     }
-  };
+  }, []);
 
   const cleanup = useCallback(() => {
     clearCallTimeout();
+
     if (pcRef.current) {
+      pcRef.current.onicecandidate = null;
+      pcRef.current.ontrack = null;
       pcRef.current.onconnectionstatechange = null;
       pcRef.current.close();
       pcRef.current = null;
     }
+
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
     }
+
+    if (remoteStreamRef.current) {
+      remoteStreamRef.current.getTracks().forEach((track) => track.stop());
+      remoteStreamRef.current = null;
+    }
+
     pendingOfferRef.current = null;
     pendingCandidatesRef.current = [];
+
     setLocalStream(null);
     setRemoteStream(null);
     setPeerInfo(null);
     setIsMuted(false);
     setIsCameraOff(false);
     setCallState('idle');
-  }, []);
+  }, [clearCallTimeout]);
 
   const flushPendingCandidates = useCallback(async (pc) => {
-    const queued = pendingCandidatesRef.current;
+    if (!pc || !pc.remoteDescription) return;
+
+    const queuedCandidates = [...pendingCandidatesRef.current];
     pendingCandidatesRef.current = [];
-    for (const candidate of queued) {
+
+    for (const candidate of queuedCandidates) {
       try {
         await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch {
-        // Invalid/stale candidate — safe to skip.
+      } catch (error) {
+        console.error('Failed to add queued ICE candidate:', error);
       }
     }
   }, []);
 
   const createPeerConnection = useCallback(
     (otherUserId) => {
-      const pc = new RTCPeerConnection({ iceServers: getIceServers() });
+      const pc = new RTCPeerConnection({
+        iceServers: getIceServers(),
+      });
 
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          socket.emit('ice_candidate', { toUserId: otherUserId, candidate: event.candidate });
+          socket.emit('ice_candidate', {
+            toUserId: otherUserId,
+            candidate: event.candidate,
+          });
         }
       };
 
-      pc.ontrack = () => {
-        // Build a new MediaStream from every remote receiver each time a track
-        // arrives. This avoids React keeping the same stream reference and
-        // ensures late-arriving audio/video tracks both reach the UI.
-        const nextRemoteStream = new MediaStream(
-          pc.getReceivers().map((receiver) => receiver.track).filter(Boolean)
-        );
-        setRemoteStream(nextRemoteStream);
+      pc.ontrack = (event) => {
+        if (!remoteStreamRef.current) {
+          remoteStreamRef.current = new MediaStream();
+        }
+
+        const currentStream = remoteStreamRef.current;
+
+        if (!currentStream.getTracks().some((track) => track.id === event.track.id)) {
+          currentStream.addTrack(event.track);
+        }
+
+        // Create a fresh MediaStream so React detects every track update.
+        setRemoteStream(new MediaStream(currentStream.getTracks()));
       };
 
-      // The offer/answer handshake completing doesn't mean media is
-      // actually flowing yet — track the real transport state so the UI
-      // isn't lying about "connected" while negotiation is still underway
-      // or has failed outright.
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected') {
           clearCallTimeout();
           setCallState('connected');
-        } else if (pc.connectionState === 'failed') {
+        } else if (
+          pc.connectionState === 'failed' ||
+          pc.connectionState === 'disconnected'
+        ) {
           setCallError('Call connection failed — check your network and try again');
           cleanup();
         }
@@ -108,7 +126,7 @@ export const useCall = (socket) => {
       pcRef.current = pc;
       return pc;
     },
-    [socket, cleanup, flushPendingCandidates]
+    [socket, clearCallTimeout, cleanup]
   );
 
   const startCall = useCallback(
@@ -125,28 +143,42 @@ export const useCall = (socket) => {
           audio: true,
           video: type === 'video',
         });
+
         localStreamRef.current = stream;
         setLocalStream(stream);
 
         const pc = createPeerConnection(userId);
-        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+        stream.getTracks().forEach((track) => {
+          pc.addTrack(track, stream);
+        });
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        socket.emit('call_user', { toUserId: userId, offer, callType: type }, (ack) => {
-          if (!ack?.success) {
-            setCallError(ack?.message || 'Call could not be started');
-            cleanup();
-            return;
+        socket.emit(
+          'call_user',
+          {
+            toUserId: userId,
+            offer,
+            callType: type,
+          },
+          (ack) => {
+            if (!ack?.success) {
+              setCallError(ack?.message || 'Call could not be started');
+              cleanup();
+              return;
+            }
+
+            timeoutRef.current = setTimeout(() => {
+              setCallError('No answer');
+              socket.emit('end_call', { toUserId: userId });
+              cleanup();
+            }, CALL_TIMEOUT_MS);
           }
-          timeoutRef.current = setTimeout(() => {
-            setCallError('No answer');
-            socket.emit('end_call', { toUserId: userId });
-            cleanup();
-          }, CALL_TIMEOUT_MS);
-        });
-      } catch (err) {
+        );
+      } catch (error) {
+        console.error('Failed to start call:', error);
         setCallError('Camera/microphone access denied or unavailable');
         cleanup();
       }
@@ -156,6 +188,7 @@ export const useCall = (socket) => {
 
   const acceptCall = useCallback(async () => {
     if (!socket || !pendingOfferRef.current) return;
+
     const { fromUserId, offer } = pendingOfferRef.current;
 
     try {
@@ -163,87 +196,125 @@ export const useCall = (socket) => {
         audio: true,
         video: callType === 'video',
       });
+
       localStreamRef.current = stream;
       setLocalStream(stream);
 
-      // Creating the peer connection here also flushes any ICE candidates
-      // from the caller that arrived while we were still ringing.
       const pc = createPeerConnection(fromUserId);
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+      stream.getTracks().forEach((track) => {
+        pc.addTrack(track, stream);
+      });
 
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      // ICE candidates can only be added safely after a remote description
-      // exists. Flush candidates queued while the call was ringing now.
       await flushPendingCandidates(pc);
+
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
 
-      socket.emit('answer_call', { toUserId: fromUserId, answer });
+      socket.emit('answer_call', {
+        toUserId: fromUserId,
+        answer,
+      });
+
       pendingOfferRef.current = null;
-      // Signaling is done; actual "connected" now waits on
-      // onconnectionstatechange so the UI reflects real media state.
       setCallState('connecting');
-    } catch (err) {
+    } catch (error) {
+      console.error('Failed to accept call:', error);
       setCallError('Camera/microphone access denied or unavailable');
       socket.emit('call_declined', { toUserId: fromUserId });
       cleanup();
     }
-  }, [socket, callType, createPeerConnection, cleanup, flushPendingCandidates]);
+  }, [
+    socket,
+    callType,
+    createPeerConnection,
+    cleanup,
+    flushPendingCandidates,
+  ]);
 
   const declineCall = useCallback(() => {
     if (!socket || !pendingOfferRef.current) return;
-    socket.emit('call_declined', { toUserId: pendingOfferRef.current.fromUserId });
+
+    socket.emit('call_declined', {
+      toUserId: pendingOfferRef.current.fromUserId,
+    });
+
     cleanup();
   }, [socket, cleanup]);
 
   const endCall = useCallback(() => {
     if (!socket || !peerInfo) return;
-    socket.emit('end_call', { toUserId: peerInfo.userId });
+
+    socket.emit('end_call', {
+      toUserId: peerInfo.userId,
+    });
+
     cleanup();
   }, [socket, peerInfo, cleanup]);
 
   const toggleMute = useCallback(() => {
     if (!localStreamRef.current) return;
+
     localStreamRef.current.getAudioTracks().forEach((track) => {
       track.enabled = !track.enabled;
     });
-    setIsMuted((prev) => !prev);
+
+    setIsMuted((previous) => !previous);
   }, []);
 
   const toggleCamera = useCallback(() => {
     if (!localStreamRef.current) return;
+
     localStreamRef.current.getVideoTracks().forEach((track) => {
       track.enabled = !track.enabled;
     });
-    setIsCameraOff((prev) => !prev);
+
+    setIsCameraOff((previous) => !previous);
   }, []);
 
   useEffect(() => {
     if (!socket) return undefined;
 
-    const handleCallMade = ({ fromUserId, fromUsername, offer, callType: incomingType }) => {
-      // No call-waiting support in this MVP — auto-decline if already busy.
+    const handleCallMade = ({
+      fromUserId,
+      fromUsername,
+      offer,
+      callType: incomingType,
+    }) => {
       if (callStateRef.current !== 'idle') {
-        socket.emit('call_declined', { toUserId: fromUserId });
+        socket.emit('call_declined', {
+          toUserId: fromUserId,
+        });
         return;
       }
-      pendingOfferRef.current = { fromUserId, offer };
+
+      pendingOfferRef.current = {
+        fromUserId,
+        offer,
+      };
+
       setCallError('');
       setCallType(incomingType === 'video' ? 'video' : 'audio');
-      setPeerInfo({ userId: fromUserId, username: fromUsername });
+      setPeerInfo({
+        userId: fromUserId,
+        username: fromUsername,
+      });
       setCallState('incoming');
     };
 
     const handleCallAnswered = async ({ answer }) => {
       clearCallTimeout();
-      if (!pcRef.current) return;
+
+      const pc = pcRef.current;
+      if (!pc) return;
+
       try {
-        await pcRef.current.setRemoteDescription(new RTCSessionDescription(answer));
-        await flushPendingCandidates(pcRef.current);
-        // Signaling is done; actual "connected" now waits on
-        // onconnectionstatechange so the UI reflects real media state.
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        await flushPendingCandidates(pc);
         setCallState('connecting');
-      } catch {
+      } catch (error) {
+        console.error('Failed to apply call answer:', error);
         setCallError('Failed to connect the call');
         cleanup();
       }
@@ -252,18 +323,18 @@ export const useCall = (socket) => {
     const handleIceCandidate = async ({ candidate }) => {
       if (!candidate) return;
 
-      // Queue candidates until both the peer connection and its remote
-      // description exist. Adding them earlier can throw and silently lose
-      // the route needed for remote media.
-      if (!pcRef.current || !pcRef.current.remoteDescription) {
+      const pc = pcRef.current;
+
+      // Queue candidates until both the peer connection and remote description exist.
+      if (!pc || !pc.remoteDescription) {
         pendingCandidatesRef.current.push(candidate);
         return;
       }
 
       try {
-        await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch {
-        // Late/invalid candidates can be safely ignored.
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (error) {
+        console.error('Failed to add ICE candidate:', error);
       }
     };
 
@@ -289,11 +360,16 @@ export const useCall = (socket) => {
       socket.off('call_declined', handleCallDeclined);
       socket.off('call_ended', handleCallEnded);
     };
-  }, [socket, cleanup, flushPendingCandidates]);
+  }, [
+    socket,
+    cleanup,
+    clearCallTimeout,
+    flushPendingCandidates,
+  ]);
 
-  // Safety net: release camera/mic and close the peer connection if the
-  // component using this hook unmounts mid-call.
-  useEffect(() => () => cleanup(), [cleanup]);
+  useEffect(() => {
+    return () => cleanup();
+  }, [cleanup]);
 
   return {
     callState,
