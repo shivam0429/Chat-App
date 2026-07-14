@@ -81,8 +81,14 @@ export const useCall = (socket) => {
         }
       };
 
-      pc.ontrack = (event) => {
-        setRemoteStream(event.streams[0]);
+      pc.ontrack = () => {
+        // Build a new MediaStream from every remote receiver each time a track
+        // arrives. This avoids React keeping the same stream reference and
+        // ensures late-arriving audio/video tracks both reach the UI.
+        const nextRemoteStream = new MediaStream(
+          pc.getReceivers().map((receiver) => receiver.track).filter(Boolean)
+        );
+        setRemoteStream(nextRemoteStream);
       };
 
       // The offer/answer handshake completing doesn't mean media is
@@ -100,8 +106,6 @@ export const useCall = (socket) => {
       };
 
       pcRef.current = pc;
-      // Apply any ICE candidates that arrived before this connection existed.
-      flushPendingCandidates(pc);
       return pc;
     },
     [socket, cleanup, flushPendingCandidates]
@@ -168,6 +172,9 @@ export const useCall = (socket) => {
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      // ICE candidates can only be added safely after a remote description
+      // exists. Flush candidates queued while the call was ringing now.
+      await flushPendingCandidates(pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
 
@@ -181,7 +188,7 @@ export const useCall = (socket) => {
       socket.emit('call_declined', { toUserId: fromUserId });
       cleanup();
     }
-  }, [socket, callType, createPeerConnection, cleanup]);
+  }, [socket, callType, createPeerConnection, cleanup, flushPendingCandidates]);
 
   const declineCall = useCallback(() => {
     if (!socket || !pendingOfferRef.current) return;
@@ -232,6 +239,7 @@ export const useCall = (socket) => {
       if (!pcRef.current) return;
       try {
         await pcRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+        await flushPendingCandidates(pcRef.current);
         // Signaling is done; actual "connected" now waits on
         // onconnectionstatechange so the UI reflects real media state.
         setCallState('connecting');
@@ -244,9 +252,10 @@ export const useCall = (socket) => {
     const handleIceCandidate = async ({ candidate }) => {
       if (!candidate) return;
 
-      // No peer connection yet (e.g. we haven't accepted the call yet) —
-      // queue it instead of dropping it.
-      if (!pcRef.current) {
+      // Queue candidates until both the peer connection and its remote
+      // description exist. Adding them earlier can throw and silently lose
+      // the route needed for remote media.
+      if (!pcRef.current || !pcRef.current.remoteDescription) {
         pendingCandidatesRef.current.push(candidate);
         return;
       }
@@ -280,7 +289,7 @@ export const useCall = (socket) => {
       socket.off('call_declined', handleCallDeclined);
       socket.off('call_ended', handleCallEnded);
     };
-  }, [socket, cleanup]);
+  }, [socket, cleanup, flushPendingCandidates]);
 
   // Safety net: release camera/mic and close the peer connection if the
   // component using this hook unmounts mid-call.
