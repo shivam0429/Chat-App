@@ -6,15 +6,13 @@ const getTransporter = () => {
   if (transporter) return transporter;
 
   transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true,
-
+    host: 'smtp-relay.brevo.com',
+    port: 587,
+    secure: false,
     auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS,
+      user: process.env.BREVO_SMTP_USER,
+      pass: process.env.BREVO_SMTP_KEY,
     },
-
     connectionTimeout: 20000,
     greetingTimeout: 20000,
     socketTimeout: 30000,
@@ -25,9 +23,7 @@ const getTransporter = () => {
 
 export const sendEmail = async ({ to, subject, html }) => {
   try {
-    const mailer = getTransporter();
-
-    const info = await mailer.sendMail({
+    const info = await getTransporter().sendMail({
       from: `"ChatFlow" <${process.env.EMAIL_USER}>`,
       to,
       subject,
@@ -70,14 +66,11 @@ export const sendPasswordResetEmail = async ({ to, resetUrl }) => {
           </a>
         </p>
 
-        <p>
-          If you didn't request this, you can safely ignore this email.
-        </p>
+        <p>If you didn't request this, you can safely ignore this email.</p>
 
         <p style="color:#888;font-size:12px;">
           If the button doesn't work, copy and paste this link:
-          <br />
-          ${resetUrl}
+          <br />${resetUrl}
         </p>
       </div>
     `,
