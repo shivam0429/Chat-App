@@ -1,44 +1,38 @@
-import nodemailer from 'nodemailer';
-
-let transporter;
-
-const getTransporter = () => {
-  if (transporter) return transporter;
-
-  transporter = nodemailer.createTransport({
-    host: 'smtp-relay.brevo.com',
-    port: 587,
-    secure: false,
-    auth: {
-      user: process.env.BREVO_SMTP_USER,
-      pass: process.env.BREVO_SMTP_KEY,
-    },
-    connectionTimeout: 20000,
-    greetingTimeout: 20000,
-    socketTimeout: 30000,
-  });
-
-  return transporter;
-};
-
 export const sendEmail = async ({ to, subject, html }) => {
   try {
-    const info = await getTransporter().sendMail({
-      from: `"ChatFlow" <${process.env.EMAIL_USER}>`,
-      to,
-      subject,
-      html,
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'api-key': process.env.BREVO_API_KEY,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        sender: {
+          name: 'ChatFlow',
+          email: process.env.EMAIL_USER,
+        },
+        to: [
+          {
+            email: to,
+          },
+        ],
+        subject,
+        htmlContent: html,
+      }),
     });
 
-    console.log('Email sent successfully:', info.messageId);
-    return info;
+    const result = await response.json();
+
+    if (!response.ok) {
+      console.error('BREVO API ERROR:', result);
+      throw new Error(result.message || 'Failed to send email');
+    }
+
+    console.log('Email sent successfully:', result.messageId);
+    return result;
   } catch (error) {
-    console.error('EMAIL SEND ERROR:', {
-      message: error.message,
-      code: error.code,
-      command: error.command,
-    });
-
+    console.error('EMAIL SEND ERROR:', error.message);
     throw error;
   }
 };
